@@ -1,250 +1,317 @@
 import streamlit as st
-import pandas as pd
+import collections
+import time
+import random
+import matplotlib.pyplot as plt
 import numpy as np
-import plotly.express as px
-from logic import BalanceBoxLogic  # 분리된 로직 파일(logic.py) import
 
-# ==========================================
-# [Module 2] UI Rendering & Logic
-# ==========================================
-st.set_page_config(layout="wide", page_title="Balance Box Algo")
+# --- [1. 알고리즘 로직 클래스] ---
 
-# --- Custom CSS for Box Visualization ---
-# 큐(Queue) 시각화를 위한 스타일 정의
+class Item:
+    def __init__(self, item_id, entry_price, item_type, state="Recruit"):
+        self.id = item_id
+        self.entry_price = entry_price
+        self.item_type = item_type  # "Call" or "Put"
+        self.state = state          # Recruit, Combat, Wounded, Defeated
+        self.real_profit = 0
+        self.virtual_profit = 0     # 가상수익
+
+class BalancedBoxLogic:
+    def __init__(self, verbose=True):
+        self.call_queue = collections.deque()
+        self.put_queue = collections.deque()
+        
+        # 우선순위 Pool
+        self.wounded_pool = collections.deque()
+        self.defeated_pool = collections.deque()
+        
+        # [변경 1] Recruit Pool 크기 제거 (무한 카운터 사용)
+        self.next_recruit_id = 0
+        
+        self.current_price = 1000.0
+        self.logs = []
+        self.total_realized_profit = 0
+        self.verbose = verbose # 로깅 여부 (시뮬레이션 속도 최적화용)
+        
+        # 초기화 시 자동 실행 (Call/Put 1개씩)
+        self.initialize_queues()
+
+    def log(self, msg):
+        if self.verbose:
+            timestamp = time.strftime("%H:%M:%S")
+            self.logs.insert(0, f"[{timestamp}] {msg}")
+
+    def get_soldier_id(self):
+        # 진입 우선순위 로직
+        if self.wounded_pool:
+            return self.wounded_pool.popleft(), "🚑부상병"
+        elif self.defeated_pool:
+            return self.defeated_pool.popleft(), "🎖️패잔병"
+        else:
+            new_id = self.next_recruit_id
+            self.next_recruit_id += 1
+            return new_id, "👶신병"
+
+    def initialize_queues(self):
+        # 초기 세팅: Call/Put 각각 1개씩 진입 상태로 시작
+        if not self.call_queue:
+            cid, origin = self.get_soldier_id()
+            self.call_queue.append(Item(cid, self.current_price, "Call", "Combat"))
+            self.log(f"🏁 초기 세팅: Call Item({cid}) 투입")
+        
+        if not self.put_queue:
+            pid, origin = self.get_soldier_id()
+            self.put_queue.append(Item(pid, self.current_price, "Put", "Combat"))
+            self.log(f"🏁 초기 세팅: Put Item({pid}) 투입")
+
+    def get_unrealized_profit(self):
+        call_p = sum(i.real_profit for i in self.call_queue)
+        put_p = sum(i.real_profit for i in self.put_queue)
+        return call_p + put_p
+
+    def can_enter(self, queue):
+        if not queue: return True
+        for item in queue:
+            if item.real_profit > 0 or item.virtual_profit > 0:
+                return True
+        return False
+
+    def pop_item(self, queue, reason):
+        if not queue: return
+        item = queue.popleft()
+        
+        if item.real_profit < 0:
+            item.state = "Wounded"
+            self.wounded_pool.appendleft(item.id) # 부상병은 Queue Front로
+            self.log(f"💥 POP(손실): {item.item_type}{item.id} (R:{item.real_profit}) -> 부상병 이동")
+        else:
+            item.state = "Defeated"
+            self.defeated_pool.append(item.id)
+            self.total_realized_profit += item.real_profit
+            self.log(f"💰 POP(이익): {item.item_type}{item.id} (R:{item.real_profit}) -> 이익 확정")
+
+    def update_profits(self, is_up):
+        if is_up:
+            for i in self.call_queue:
+                i.real_profit += 1
+                i.virtual_profit += 1
+            for i in self.put_queue:
+                i.real_profit -= 1
+                i.virtual_profit = max(0, i.virtual_profit - 1) if i.virtual_profit > 0 else 0
+        else:
+            for i in self.call_queue:
+                i.real_profit -= 1
+                i.virtual_profit = max(0, i.virtual_profit - 1) if i.virtual_profit > 0 else 0
+            for i in self.put_queue:
+                i.real_profit += 1
+                i.virtual_profit += 1
+
+    def check_balance(self, is_up):
+        # 1. 수량 균형
+        while len(self.call_queue) >= len(self.put_queue) + 2:
+            self.pop_item(self.call_queue, "균형조절(수량)")
+        while len(self.put_queue) >= len(self.call_queue) + 2:
+            self.pop_item(self.put_queue, "균형조절(수량)")
+
+        # 2. 방향성 제한
+        if not is_up: # 하락장
+             while len(self.call_queue) > len(self.put_queue):
+                 self.pop_item(self.call_queue, "방향성제한(Call축소)")
+        if is_up: # 상승장
+            while len(self.put_queue) > len(self.call_queue):
+                self.pop_item(self.put_queue, "방향성제한(Put축소)")
+
+    def step(self, direction):
+        is_up = (direction == "UP")
+        price_change = 10 if is_up else -10
+        self.current_price += price_change
+        
+        arrow = "🔺" if is_up else "🟦"
+        self.log(f"{arrow} 가격변동: {direction} (현재가: {self.current_price})")
+
+        self.update_profits(is_up)
+
+        if is_up:
+            if self.can_enter(self.call_queue):
+                sid, origin = self.get_soldier_id()
+                self.call_queue.append(Item(sid, self.current_price, "Call", "Combat"))
+                self.log(f"➕ Call 진입 (ID:{sid}, {origin})")
+            else:
+                self.log("✋ Call 진입 대기 (조건 미충족)")
+        else:
+            if self.can_enter(self.put_queue):
+                sid, origin = self.get_soldier_id()
+                self.put_queue.append(Item(sid, self.current_price, "Put", "Combat"))
+                self.log(f"➕ Put 진입 (ID:{sid}, {origin})")
+            else:
+                self.log("✋ Put 진입 대기 (조건 미충족)")
+
+        self.check_balance(is_up)
+
+
+# --- [2. Streamlit UI 구성] ---
+
+st.set_page_config(page_title="Balanced Box Pro Simulator", layout="wide")
+
+# CSS 수정: [1] raw tag 방지(코드에서는 f-string 들여쓰기 제거로 해결), [2] 글자색 강제 검정
 st.markdown("""
 <style>
-    .box-container {
+    .card-container {
         display: flex;
-        flex-direction: column-reverse; /* 아래에서 위로 쌓이는 스택 구조 */
-        align_items: center;
-        gap: 5px;
+        flex-direction: column; /* 카드가 위에서 아래로 쌓이도록 변경 */
+        gap: 6px;
         padding: 10px;
-        border-radius: 5px;
+        background-color: #f8f9fa;
+        border-radius: 8px;
         min-height: 300px;
-        justify-content: flex-start;
+        max-height: 500px;
+        overflow-y: auto;
     }
-    .algo-box {
-        width: 100%;
-        padding: 10px;
-        text-align: center;
-        border-radius: 5px;
-        color: white;
-        font-weight: bold;
-        box-shadow: 2px 2px 5px rgba(0,0,0,0.2);
-        font-size: 0.9em;
+    .trade-card {
+        padding: 8px 12px;
+        border-radius: 6px;
+        background: white;
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        border-left: 5px solid #ccc;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        font-family: sans-serif;
+        color: #333 !important; /* 글자색 강제 검정 (Dark Mode 대응) */
     }
-    .box-call { background-color: #FF4B4B; border: 1px solid #b30000; }
-    .box-put { background-color: #1E90FF; border: 1px solid #0050b3; }
-    .box-head { border: 3px solid #FFD700; position: relative; } /* Head(0번 인덱스) 강조 */
-    .box-head::after { content: "HEAD"; position: absolute; top:-10px; right:-5px; background:gold; color:black; font-size:0.6em; padding:2px; border-radius:3px;}
-    .stat-metric { font-size: 1.5rem; font-weight: bold; }
+    .profit-plus { border-left-color: #4CAF50 !important; background-color: #e8f5e9; }
+    .profit-minus { border-left-color: #FF5252 !important; background-color: #ffebee; }
+    
+    .card-id { font-weight: bold; font-size: 14px; color: #000 !important; }
+    
+    .metric-label { font-size: 12px; color: #555 !important; margin-right: 2px; }
+    .metric-val { font-weight: bold; font-size: 13px; color: #333 !important; }
+    
+    .val-plus { color: #2E7D32 !important; }
+    .val-minus { color: #C62828 !important; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("⚖️ Balance Box Algorithm Presentation")
+st.title("⚖️ Balanced Box Pro Simulator")
 
-# --- Sidebar Configuration ---
+if 'sim' not in st.session_state:
+    st.session_state.sim = BalancedBoxLogic()
+
+sim = st.session_state.sim
+
+# --- [사이드바] ---
 with st.sidebar:
-    st.header("⚙️ Settings")
+    st.header("🎮 컨트롤러")
     
-    # 전략 선택 (Strategy Selection)
-    st.subheader("1. Strategy Type")
-    strategy_option = st.radio(
-        "Select Algorithm Strategy",
-        ["Gap Balance (Original)", "Fixed Size Limit (New)"],
-        index=0,
-        help="Gap Balance: 큐 길이 '차이'가 Box Size 초과 시 청산\nFixed Limit: 각 큐 '길이'가 Box Size 초과 시 청산"
-    )
+    tab_manual, tab_mc = st.tabs(["👆 수동 조작", "🎲 몬테카를로"])
     
-    # UI 선택값을 로직 내부 코드로 매핑
-    strat_map = {"Gap Balance (Original)": "diff", "Fixed Size Limit (New)": "fixed"}
-    selected_strat = strat_map[strategy_option]
-
-    st.subheader("2. Parameters")
-    # 사용자 입력 설정
-    setting_box_size = st.number_input("Balance Box Size (N)", value=2, min_value=1, help="청산 기준이 되는 임계값 (차이 또는 절대 길이)")
-    setting_unit = st.number_input("Unit Point Value", value=10, min_value=1)
-    
-    st.divider()
-    st.markdown("### 📊 Simulation Mode")
-    mode = st.radio("Mode", ["Manual Presentation", "Monte Carlo Sim"])
-    
-    st.divider()
-    # 리셋 버튼
-    if st.button("🔄 Reset System"):
-        if 'logic' in st.session_state:
-            del st.session_state.logic
-        st.rerun()
-
-# --- Initialize Logic ---
-# 로직 인스턴스 생성 또는 불러오기 (초기화 시 전략 타입 전달)
-if 'logic' not in st.session_state:
-    st.session_state.logic = BalanceBoxLogic(setting_box_size, setting_unit, selected_strat)
-
-# 현재 세션의 로직 인스턴스
-algo = st.session_state.logic
-
-# 설정값(전략, 파라미터)이 변경되면 로직 리셋 (Hot Reload)
-# 기존 인스턴스의 설정과 현재 사이드바 설정이 다르면 재생성
-if (algo.box_size != setting_box_size or 
-    algo.unit_point != setting_unit or 
-    algo.strategy_type != selected_strat):
-    
-    st.session_state.logic = BalanceBoxLogic(setting_box_size, setting_unit, selected_strat)
-    st.toast(f"Strategy changed to '{selected_strat}' & Reset!", icon="✅")
-    st.rerun()
-
-# ==========================================
-# MODE 1: Manual Presentation (수동 시연 모드)
-# ==========================================
-if mode == "Manual Presentation":
-    
-    # --- [개선된 상단 지표] ---
-    # 실시간 금융 데이터 계산 (logic.py에 get_unrealized_pnl 메서드가 추가되어야 합니다)
-    realized_pnl = algo.total_profit * algo.unit_point
-    try:
-        unrealized_pnl_points = algo.get_unrealized_pnl()
-        unrealized_pnl = unrealized_pnl_points * algo.unit_point
-    except AttributeError:
-         # logic.py가 아직 업데이트되지 않았을 경우를 대비한 예외처리
-         unrealized_pnl = 0
-         st.error("⚠️ 'logic.py' 파일에 'get_unrealized_pnl' 메서드 추가가 필요합니다.")
-
-    total_equity = realized_pnl + unrealized_pnl
-
-    # 5개의 컬럼으로 확장하여 상세 정보 표시
-    m1, m2, m3, m4, m5 = st.columns(5)
-    
-    m1.metric("💰 Realized Profit", f"${realized_pnl:,}", help="청산이 완료되어 확정된 수익")
-    # 평가 손익은 음수일 때 빨간색(inverse)으로 표시
-    m2.metric("📉 Unrealized PnL", f"${unrealized_pnl:,}", delta=f"{unrealized_pnl:,}", delta_color="inverse", help="현재 보유 중인 포지션들의 평가 손익 합계")
-    m3.metric("💵 Total Equity", f"${total_equity:,}", help="확정 수익 + 평가 손익 (실제 계좌 가치)")
-    
-    # 전략에 따른 불균형 지표
-    if algo.strategy_type == "diff":
-        m4.metric("Queue Imbalance", f"{len(algo.call_q) - len(algo.put_q)}", delta_color="off", help="Call - Put (기준: Gap Balance)")
-    else:
-        m4.metric("Max Queue Size", f"{max(len(algo.call_q), len(algo.put_q))}", delta_color="off", help="최대 큐 길이 (기준: Fixed Limit)")
+    with tab_manual:
+        c1, c2 = st.columns(2)
+        if c1.button("📈 상승 (UP)", use_container_width=True): sim.step("UP")
+        if c2.button("📉 하락 (DOWN)", use_container_width=True): sim.step("DOWN")
         
-    m5.metric("Total Positions", f"{len(algo.call_q) + len(algo.put_q)}", help="현재 보유 중인 총 포지션 수")
-
-    st.divider()
-
-    # 2. 메인 조작 및 시각화 영역
-    col_vis, col_ctrl = st.columns([2, 1])
-
-    with col_ctrl:
-        st.subheader("🕹️ Market Action")
-        st.write("시장의 움직임을 선택하세요.")
-        
-        # 조작 버튼
-        btn_col1, btn_col2 = st.columns(2)
-        if btn_col1.button(f"📈 상승 (+{algo.unit_point})", use_container_width=True, type="primary"):
-            algo.next_step(1)
+        st.divider()
+        if st.button("🔄 리셋 (초기화)", use_container_width=True):
+            st.session_state.sim = BalancedBoxLogic()
             st.rerun()
-            
-        if btn_col2.button(f"📉 하락 (-{algo.unit_point})", use_container_width=True, type="primary"):
-            algo.next_step(-1)
-            st.rerun()
-            
-        # 시스템 로그 출력창
-        st.subheader("📜 System Log")
-        log_container = st.container(height=400)
-        for log in algo.logs:
-            if "청산" in log:
-                log_container.markdown(f":red[{log}]")
-            elif "대기" in log:
-                log_container.markdown(f":orange[{log}]")
-            else:
-                log_container.text(log)
 
-    with col_vis:
-        st.subheader("🏗️ Queue Visualization")
+    with tab_mc:
+        st.markdown("### 시뮬레이션 설정")
+        mc_cases = st.number_input("시뮬레이션 횟수", min_value=10, max_value=1000, value=100, step=10)
+        mc_steps = st.number_input("케이스 당 스텝 수", min_value=10, max_value=500, value=50, step=10)
+        up_prob = st.slider("상승 확률 (0.5=랜덤)", 0.0, 1.0, 0.5)
         
-        # 큐 데이터 가져오기 (UI용 Helper 함수 사용)
-        c_list, p_list = algo.get_queue_display_data()
-        
-        v_col1, v_col2 = st.columns(2)
-        
-        # --- Call Stack Visualization ---
-        with v_col1:
-            st.markdown(f"<h4 style='text-align:center; color:#FF4B4B;'>Call Queue ({len(c_list)})</h4>", unsafe_allow_html=True)
-            # 기준선 표시 (Fixed Limit 모드일 때만)
-            if algo.strategy_type == "fixed":
-                st.caption(f"📏 Limit Line: {algo.box_size}")
-                
-            html_calls = '<div class="box-container">'
-            for item in c_list:
-                head_cls = "box-head" if item['IsHead'] else ""
-                # f-string 내부 들여쓰기 제거 (Markdown Code Block 방지)
-                html_calls += f"""<div class="algo-box box-call {head_cls}">{item['ID']}<br><small>R:{item['Real']} / V:{item['Virtual']}</small></div>"""
-            html_calls += "</div>"
-            st.markdown(html_calls, unsafe_allow_html=True)
+        run_mc = st.button("🚀 시뮬레이션 실행", use_container_width=True)
 
-        # --- Put Stack Visualization ---
-        with v_col2:
-            st.markdown(f"<h4 style='text-align:center; color:#1E90FF;'>Put Queue ({len(p_list)})</h4>", unsafe_allow_html=True)
-            if algo.strategy_type == "fixed":
-                st.caption(f"📏 Limit Line: {algo.box_size}")
-                
-            html_puts = '<div class="box-container">'
-            for item in p_list:
-                head_cls = "box-head" if item['IsHead'] else ""
-                # f-string 내부 들여쓰기 제거 (Markdown Code Block 방지)
-                html_puts += f"""<div class="algo-box box-put {head_cls}">{item['ID']}<br><small>R:{item['Real']} / V:{item['Virtual']}</small></div>"""
-            html_puts += "</div>"
-            st.markdown(html_puts, unsafe_allow_html=True)
-            
-    # 3. 수익 곡선 차트
-    st.subheader("📈 Profit Curve (Realized)")
-    if len(algo.history_balance) > 0:
-        fig = px.line(y=algo.history_balance, x=range(len(algo.history_balance)), 
-                      labels={'x': 'Step', 'y': 'Total Profit'}, title="Accumulated Realized Profit")
-        fig.update_layout(height=300)
-        st.plotly_chart(fig, use_container_width=True)
+    st.divider()
+    unrealized = sim.get_unrealized_profit()
+    total_equity = sim.total_realized_profit + unrealized
+    
+    st.markdown("### 💰 자산 현황")
+    st.metric("실현 수익 (Realized)", f"{sim.total_realized_profit:+d}")
+    st.metric("미실현 수익 (Unrealized)", f"{unrealized:+d}", delta_color="off")
+    st.metric("총 자산 (Total Equity)", f"{total_equity:+d}")
 
-# ==========================================
-# MODE 2: Monte Carlo Simulation (자동 시뮬레이션 모드)
-# ==========================================
+# --- [메인 화면] ---
+
+if run_mc:
+    st.subheader(f"📊 몬테카를로 시뮬레이션 결과 ({mc_cases}회)")
+    results = []
+    progress_bar = st.progress(0)
+    
+    for i in range(mc_cases):
+        mc_sim = BalancedBoxLogic(verbose=False)
+        for _ in range(mc_steps):
+            direction = "UP" if random.random() < up_prob else "DOWN"
+            mc_sim.step(direction)
+        final_equity = mc_sim.total_realized_profit + mc_sim.get_unrealized_profit()
+        results.append(final_equity)
+        progress_bar.progress((i + 1) / mc_cases)
+    
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.hist(results, bins=20, color='skyblue', edgecolor='black', alpha=0.7)
+    ax.axvline(np.mean(results), color='red', linestyle='dashed', linewidth=1, label=f'Mean: {np.mean(results):.1f}')
+    ax.set_title(f"Profit Distribution (Steps: {mc_steps}, Prob: {up_prob})")
+    ax.legend()
+    st.pyplot(fig)
+    
+    c1, c2, c3 = st.columns(3)
+    c1.metric("평균 수익", f"{np.mean(results):.1f}")
+    c2.metric("최대 수익", f"{np.max(results)}")
+    c3.metric("최소 수익", f"{np.min(results)}")
+
 else:
-    st.subheader("🎲 Monte Carlo Simulation")
-    
-    mc_col1, mc_col2 = st.columns(2)
-    with mc_col1:
-        sim_count = st.slider("Number of Sims", 10, 500, 50)
-        sim_steps = st.slider("Steps per Sim", 10, 200, 100)
-    
-    if st.button("🚀 Start Simulation"):
-        all_results = []
-        progress_bar = st.progress(0)
+    # --- [HTML 렌더링 수정: Indentation 제거] ---
+    def render_html_card(queue):
+        # f-string의 들여쓰기를 제거하여 HTML이 Markdown 코드 블록으로 인식되지 않도록 함
+        html_parts = ['<div class="card-container">']
+        if not queue:
+            html_parts.append('<div style="text-align:center; color:#999; padding:20px;">비어있음</div>')
         
-        for i in range(sim_count):
-            # 시뮬레이션용 독립 인스턴스 생성 (현재 선택된 전략 적용)
-            sim_algo = BalanceBoxLogic(setting_box_size, setting_unit, selected_strat)
+        for item in queue:
+            status_cls = "profit-plus" if item.real_profit > 0 else ("profit-minus" if item.real_profit < 0 else "")
+            real_cls = "val-plus" if item.real_profit > 0 else ("val-minus" if item.real_profit < 0 else "")
+            virt_cls = "val-plus" if item.virtual_profit > 0 else ""
             
-            # 랜덤 워크 생성 (50% 확률로 상승/하락)
-            random_moves = np.random.choice([1, -1], size=sim_steps)
-            
-            for move in random_moves:
-                sim_algo.next_step(move)
-            
-            all_results.append(sim_algo.history_balance)
-            progress_bar.progress((i + 1) / sim_count)
-            
-        st.success(f"Simulation Complete! (Strategy: {selected_strat})")
+            # 한 줄로 이어지거나 들여쓰기 없이 생성
+            card_html = (
+                f'<div class="trade-card {status_cls}">'
+                f'<div class="card-id">{item.item_type[0]}{item.id:02d}</div>'
+                f'<div>'
+                f'<span class="metric-label">실:</span><span class="metric-val {real_cls}">{item.real_profit:+d}</span> '
+                f'<span class="metric-label">가:</span><span class="metric-val {virt_cls}">{item.virtual_profit:+d}</span>'
+                f'</div>'
+                f'</div>'
+            )
+            html_parts.append(card_html)
         
-        # 결과 시각화
-        results_df = pd.DataFrame(all_results).T
-        
-        st.write("### 1. Asset Paths (자산 변동 경로)")
-        st.line_chart(results_df)
-        
-        final_values = results_df.iloc[-1]
-        st.write("### 2. Distribution of Final Profit (최종 손익 분포)")
-        fig_hist = px.histogram(final_values, nbins=20, title="Final Profit Distribution")
-        fig_hist.add_vline(x=0, line_color="red")
-        st.plotly_chart(fig_hist, use_container_width=True)
-        
-        st.write(f"**Average Profit:** ${final_values.mean():,.2f}")
-        st.write(f"**Max Profit:** ${final_values.max():,.2f}")
-        st.write(f"**Min Profit:** ${final_values.min():,.2f}")
+        html_parts.append('</div>')
+        return "".join(html_parts)
+
+    col_call, col_center, col_put = st.columns([4, 0.5, 4])
+
+    with col_call:
+        st.subheader(f"🔴 Call Queue ({len(sim.call_queue)})")
+        st.markdown(render_html_card(sim.call_queue), unsafe_allow_html=True)
+
+    with col_center:
+        st.markdown("<div style='height:300px; border-left: 2px dashed #ddd; margin: 0 auto; width: 2px;'></div>", unsafe_allow_html=True)
+
+    with col_put:
+        st.subheader(f"🔵 Put Queue ({len(sim.put_queue)})")
+        st.markdown(render_html_card(sim.put_queue), unsafe_allow_html=True)
+
+    st.divider()
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### 🏥 병사 대기열")
+        wounded_str = ", ".join([f"🚑{id}" for id in sim.wounded_pool]) if sim.wounded_pool else "없음"
+        st.info(f"**부상병 (1순위):** {wounded_str}")
+        st.write(f"**패잔병 (2순위):** {len(sim.defeated_pool)}명")
+        st.write(f"**신병 (3순위):** (무제한)")
+
+    with c2:
+        st.markdown("### 📝 로그")
+        with st.container(height=200, border=True):
+            for log in sim.logs:
+                st.text(log)
